@@ -1,0 +1,143 @@
+from flask import Flask, request, redirect, render_template_string
+import requests
+import pymysql
+import random
+import string
+
+app = Flask(__name__)
+
+# Paystack LIVE secret key
+PAYSTACK_SECRET_KEY = "sk_live_5b86315197f97150885edd2f73c66e32ca3e575f"
+
+# MySQL Database config
+db_config = {
+    "host": "localhost",
+    "user": "radius",
+    "password": "12megabit21",
+    "database": "radius"
+}
+
+# Tech words list
+tech_words = [
+    "router", "cloud", "server", "linux", "script", "kernel", "cyber", "packet",
+    "firewall", "secure", "lan", "wan", "vpn", "switch", "root", "admin", "stack",
+    "byte", "pixel", "data", "signal", "core", "link", "wave", "tech", "spark",
+    "code", "bit", "net", "flow", "chip", "web", "flux", "ping", "hub", "port",
+    "drive", "mesh", "app", "loop", "scan"
+]
+
+# Data plans (MB) and prices in GHS
+plans = {
+    "2000": {"label": "2GB - GHS 6", "price": 6},
+    "5000": {"label": "5GB - GHS 15", "price": 15},
+    "10000": {"label": "10GB - GHS 30", "price": 30},
+    "50000": {"label": "50GB - GHS 140", "price": 140},
+    "150000": {"label": "150GB - GHS 300", "price": 300},
+}
+
+form_html = """
+<h2>Buy Data Package</h2>
+<form method="POST" action="/pay">
+  <label>Select Data Package:</label><br>
+  <select name="data_cap">
+    {% for key, item in plans.items() %}
+      <option value="{{ key }}">{{ item.label }}</option>
+    {% endfor %}
+  </select><br><br>
+  <label>Email (Paystack):</label><br>
+  <input type="email" name="email" required><br><br>
+  <button type="submit">Proceed to Paystack</button>
+</form>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(form_html, plans=plans)
+
+@app.route("/pay", methods=["POST"])
+def pay():
+    data_cap = request.form["data_cap"]
+    email = request.form["email"]
+
+    if data_cap not in plans:
+        return "Invalid plan selected", 400
+
+    amount = plans[data_cap]["price"] * 100  # Convert to pesewas
+    callback_url = request.url_root + "verify"
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "email": email,
+        "amount": amount,
+        "callback_url": callback_url,
+        "metadata": {"data_cap": data_cap}
+    }
+
+    response = requests.post("https://api.paystack.co/transaction/initialize", json=data, headers=headers)
+    res = response.json()
+
+    if res.get("status"):
+        return redirect(res["data"]["authorization_url"])
+    else:
+        return f"Error: {res.get('message')}"
+
+@app.route("/verify")
+def verify():
+    ref = request.args.get("reference")
+    if not ref:
+        return "Missing transaction reference"
+
+    # Verify transaction
+    headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+    response = requests.get(f"https://api.paystack.co/transaction/verify/{ref}", headers=headers)
+    result = response.json()
+
+    if not result.get("status"):
+        return "Verification failed"
+
+    data_cap = result["data"]["metadata"]["data_cap"]
+
+    # ✅ Check if reference already used
+    conn = pymysql.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM userinfo WHERE reference = %s", (ref,))
+    existing = cur.fetchone()
+
+    if existing:
+        # ✅ Show the same credentials
+        cur.execute("SELECT r.value FROM radcheck r WHERE r.username = %s AND r.attribute = 'Cleartext-Password'", (existing[0],))
+        password = cur.fetchone()[0]
+        conn.close()
+        return f"""
+        <h2>✅ Payment Already Verified</h2>
+        <p><strong>Username:</strong> {existing[0]}</p>
+        <p><strong>Password:</strong> {password}</p>
+        <p>Use these credentials to log in.</p>
+        """
+
+    # ✅ Generate new username & password
+    username = random.choice(tech_words)
+    password = random.choice(tech_words) + ''.join(random.choices(string.digits, k=2))
+
+    # Insert into DB
+    cur.execute("INSERT INTO radcheck (username, attribute, op, value) VALUES (%s, 'Cleartext-Password', ':=', %s)", (username, password))
+    cur.execute("INSERT INTO radreply (username, attribute, op, value) VALUES (%s, 'Max-Data-MB', ':=', %s)", (username, data_cap))
+    cur.execute("INSERT INTO radusergroup (username, groupname, priority) VALUES (%s, 'default', 1)", (username,))
+    cur.execute("INSERT INTO userinfo (username, creationdate, reference) VALUES (%s, NOW(), %s)", (username, ref))
+    conn.commit()
+    conn.close()
+
+    return f"""
+    <h2>✅ Payment Successful</h2>
+    <p><strong>Username:</strong> {username}</p>
+    <p><strong>Password:</strong> {password}</p>
+    <p><strong>Data Cap:</strong> {int(data_cap)//1000} GB</p>
+    <p>Use these credentials to log in.</p>
+    """
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=2090)
